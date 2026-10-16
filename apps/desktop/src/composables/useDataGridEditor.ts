@@ -911,6 +911,19 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
   }
 
   // --- Inline editing ---
+  // The pending edit lives only in the shared editValue buffer, so opening
+  // another cell must commit the previous cell first or the typed value is
+  // silently dropped (#8597). A move within the quick-entry draft row commits
+  // without promotion, matching commitEditFromCellBlur in DataGrid.
+  function flushPendingCellEdit(rowId: number, colIdx: number, nextItem: RowItem) {
+    const pending = editingCell.value;
+    if (!pending) return;
+    if (pending.rowId === rowId && pending.col === colIdx) return;
+    const pendingItem = getRowItem(pending.rowId) ?? editingSourceRowItem(pending.rowId);
+    const sameDraftRow = pendingItem?.isDraft === true && nextItem.isDraft === true;
+    commitEdit(sameDraftRow ? { promoteDraft: false } : {});
+  }
+
   function startEdit(rowId: number, colIdx: number, selectOnFocus = true) {
     if (!editable.value) return;
     if (!canEditColumn(colIdx)) return;
@@ -918,6 +931,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     if (!item || item.isDeleted) return;
     if (!item.isNew && !item.isDraft && !canEditExistingRows.value) return;
     if (isSavingNewRow(item)) return;
+    flushPendingCellEdit(rowId, colIdx, item);
     isCancelling = false;
     suppressNextBlurCommit = false;
     editingCell.value = { rowId, col: colIdx };

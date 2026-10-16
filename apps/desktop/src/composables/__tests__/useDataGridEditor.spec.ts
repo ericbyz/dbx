@@ -2367,6 +2367,47 @@ describe("useDataGridEditor cell edit focus", () => {
   });
 });
 
+describe("useDataGridEditor pending edit flush on cell switch", () => {
+  function stubFocusTarget() {
+    const focus = vi.fn();
+    vi.stubGlobal("document", { querySelector: () => ({ focus, dataset: {}, value: "" }) });
+    vi.stubGlobal("requestAnimationFrame", () => 1);
+    return focus;
+  }
+
+  it("commits the pending existing-row cell edit before opening another cell (#8597)", () => {
+    stubFocusTarget();
+    try {
+      const editor = createEditor(undefined, true, undefined, undefined, [["old", "keep", "last"]]);
+      editor.startEdit(0, 0);
+      editor.editValue.value = "typed";
+      editor.startEdit(0, 1);
+
+      expect(editor.editingCell.value).toEqual({ rowId: 0, col: 1 });
+      expect(editor.dirtyRows.value.get(0)?.get(0)).toBe("typed");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("keeps quick-entry draft input when switching cells within the draft row without promoting it (#8597)", () => {
+    stubFocusTarget();
+    try {
+      const editor = createEditor(undefined, true, undefined, undefined, [], undefined, undefined, false, true);
+      const newRowCountBefore = editor.newRows.value.length;
+      editor.startEdit(DATA_GRID_QUICK_ENTRY_DRAFT_ROW_ID, 0);
+      editor.editValue.value = "first";
+      editor.startEdit(DATA_GRID_QUICK_ENTRY_DRAFT_ROW_ID, 2);
+
+      expect(editor.editingCell.value).toEqual({ rowId: DATA_GRID_QUICK_ENTRY_DRAFT_ROW_ID, col: 2 });
+      expect(editor.quickEntryDraftRow.value[0]).toBe("first");
+      expect(editor.newRows.value).toHaveLength(newRowCountBefore);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
 describe("Mongo collection-grid clipboard round-trip", () => {
   it.each([null, MONGO_DOCUMENT_GRID_NULL, "\u0000dbx:mongo-document-grid:string:literal", "NULL"])("preserves BSON value %j through paste and save", (bsonValue) => {
     const encoded = mongoDocumentGridValue(bsonValue) as string;
