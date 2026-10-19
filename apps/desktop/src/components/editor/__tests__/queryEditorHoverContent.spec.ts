@@ -40,6 +40,41 @@ function createHarness() {
 }
 
 describe("QueryEditor hover content", () => {
+  it("keeps the focused hover search open across an IME candidate-window mouseleave", async () => {
+    const { content } = createHarness();
+    const tooltip = content.createHoverDom("users", "TABLE", "CREATE TABLE users (姓名 TEXT)");
+    const host = document.createElement("div");
+    host.className = "cm-tooltip-hover";
+    host.append(tooltip.dom);
+    document.body.append(host);
+    tooltip.mount?.();
+    cleanups.push(() => {
+      tooltip.destroy?.();
+      host.remove();
+    });
+    const dismiss = vi.fn();
+    host.addEventListener("mouseleave", dismiss);
+    const input = tooltip.dom.querySelector<HTMLInputElement>("input")!;
+    input.focus();
+    input.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+    host.dispatchEvent(new MouseEvent("mouseleave", { relatedTarget: null }));
+    expect(dismiss).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(input);
+    input.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "姓名" }));
+    input.value = "姓名";
+    input.dispatchEvent(new Event("input"));
+    await vi.waitFor(() => expect(tooltip.dom.querySelector("mark")?.textContent).toBe("姓名"));
+    expect(document.activeElement).toBe(input);
+    input.blur();
+    host.dispatchEvent(new MouseEvent("mouseleave", { relatedTarget: null }));
+    expect(dismiss).toHaveBeenCalledOnce();
+
+    input.focus();
+    tooltip.destroy?.();
+    host.dispatchEvent(new MouseEvent("mouseleave", { relatedTarget: null }));
+    expect(dismiss).toHaveBeenCalledTimes(2);
+  });
+
   it("renders plain metadata safely without creating DDL controls", () => {
     const { render } = createHarness();
     const tooltip = render(undefined, ["<img src=x>"]);

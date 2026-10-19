@@ -34,6 +34,11 @@ export function createQueryEditorHoverContent(options: QueryEditorHoverContentOp
     let layoutController: ReturnType<typeof constrainSqlHoverLayout> | null = null;
     let handleCopy: ((event: ClipboardEvent) => void) | null = null;
     let searchController: HoverSearchController | null = null;
+    let hoverHost: HTMLElement | null = null;
+    const keepFocusedSearch = (event: MouseEvent) => {
+      // Native IME candidate windows can leave the tooltip without moving focus.
+      if (searchController?.element.contains(dom.ownerDocument.activeElement)) event.stopImmediatePropagation();
+    };
 
     if (sqlContent) {
       heading.className = "flex items-center justify-between gap-3 font-medium";
@@ -128,6 +133,10 @@ export function createQueryEditorHoverContent(options: QueryEditorHoverContentOp
           ? () => {
               layoutController?.mount();
               if (handleCopy) document.addEventListener("copy", handleCopy);
+              if (searchController) {
+                hoverHost = dom.closest<HTMLElement>(".cm-tooltip-hover");
+                hoverHost?.addEventListener("mouseleave", keepFocusedSearch, true);
+              }
             }
           : undefined,
       destroy:
@@ -136,6 +145,8 @@ export function createQueryEditorHoverContent(options: QueryEditorHoverContentOp
               layoutController?.destroy();
               searchController?.destroy();
               if (handleCopy) document.removeEventListener("copy", handleCopy);
+              hoverHost?.removeEventListener("mouseleave", keepFocusedSearch, true);
+              hoverHost = null;
             }
           : undefined,
     };
