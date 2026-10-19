@@ -5,7 +5,7 @@ import { clearTableMetadataCache } from "@/lib/metadata/tableMetadataCache";
 import { resetRowIdLocatorStateForTests } from "@/lib/table/tableRowIdSupport";
 import { MAX_QUERY_RESULT_MAX_ROWS } from "@/lib/dataGrid/queryResultRowLimit";
 import { restoredDataTabReloadFilters } from "@/lib/table/tableDataRefresh";
-import type { IndexInfo, QueryResult, QueryTab } from "@/types/database";
+import type { IndexInfo, QueryTab } from "@/types/database";
 
 const mocks = vi.hoisted(() => ({
   buildTableSelectSql: vi.fn(),
