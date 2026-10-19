@@ -3656,7 +3656,10 @@ fn parse_xlsx_preview_file_with_options(
         .collect::<HashSet<_>>();
     let shared_strings = read_xlsx_shared_strings(&mut zip, &needed_shared_strings)?;
     if observed_min_row == usize::MAX || observed_min_column == usize::MAX {
-        return Err("Import file has no data rows in the selected row range".to_string());
+        return Ok((
+            ParsedImportFile { columns: Vec::new(), rows: Vec::new(), total_rows: 0, effective_encoding: None },
+            sheets,
+        ));
     }
     let start_row = observed_min_row;
     let start_column = observed_min_column;
@@ -3707,7 +3710,7 @@ fn parse_xlsx_preview_file_with_options(
     let first_preview_row = row_range.data_start_row.max(start_row);
     let last_preview_row = requested_last_row.min(observed_max_row);
     if last_preview_row < first_preview_row {
-        return Err("Import file has no data rows in the selected row range".to_string());
+        return Ok((ParsedImportFile { columns, rows: Vec::new(), total_rows: 0, effective_encoding: None }, sheets));
     }
     // Rows made of style-only cells (blank rows inserted by a spreadsheet app) carry no
     // data and are skipped here as well so the preview matches what the import writes (#8604).
@@ -3728,9 +3731,6 @@ fn parse_xlsx_preview_file_with_options(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    if rows.is_empty() {
-        return Err("Import file has no data rows in the selected row range".to_string());
-    }
     Ok((ParsedImportFile { columns, total_rows: rows.len(), rows, effective_encoding: None }, sheets))
 }
 
@@ -4672,7 +4672,8 @@ async fn parse_import_preview_file_with_options(
             tokio::task::spawn_blocking(move || parse_xlsx_preview_file_with_options(&path, &options, preview_limit))
                 .await
                 .map_err(|e| e.to_string())??;
-        return Ok((parsed, false, sheets));
+        let total_rows_exact = parsed.total_rows == 0;
+        return Ok((parsed, total_rows_exact, sheets));
     }
 
     let parsed = parse_import_file_with_options(path, Some(format), options, preview_limit).await?;
@@ -9116,7 +9117,10 @@ mod tests {
         assert_eq!(preview.rows, parsed.rows);
         assert_eq!(parsed.total_rows, 2);
         let limited = TableImportParseOptions { last_data_row: Some(99), ..options };
-        assert!(parse_xlsx_preview_file_with_options(&path.to_string_lossy(), &limited, 1).is_err());
+        let (empty_preview, sheets) =
+            parse_xlsx_preview_file_with_options(&path.to_string_lossy(), &limited, 1).unwrap();
+        assert!(empty_preview.rows.is_empty());
+        assert!(!sheets.is_empty());
         assert!(parse_xlsx_file_with_options(&path.to_string_lossy(), &limited, 1).is_err());
         let _ = std::fs::remove_file(path);
     }
