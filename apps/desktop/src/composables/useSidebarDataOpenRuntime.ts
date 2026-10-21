@@ -14,6 +14,7 @@ import { hasTreeNodeDatabaseContext } from "@/lib/sidebar/treeNodeContext";
 import { buildTableSelectSql, requiresEagerTableMetadataForDataOpen } from "@/lib/table/tableSelectSql";
 import { resolveTableDefaultSort, applyTableDefaultSortResult } from "@/lib/table/tableDefaultSort";
 import { physicalTablePrimaryKeys, shouldIncludeSyntheticRowId } from "@/lib/table/tableEditing";
+import { markRowIdLocatorSupported, markRowIdLocatorUnsupported, rowIdLocatorUnsupported, shouldKeepRowIdLocatorDisabled, shouldRetryWithoutRowIdLocator } from "@/lib/table/tableRowIdSupport";
 import { tableOpenPageLimit } from "@/lib/table/tableOpenPageLimit";
 import { tableDataLargeValuePreviewOptions } from "@/lib/dataGrid/dataGridLargeValues";
 import { canActivateExistingDataTableTab } from "@/lib/tabs/dataTabActivation";
@@ -403,26 +404,30 @@ export function useSidebarDataOpenRuntime() {
       const primaryKeys = loadedTableMeta?.primaryKeys ?? [];
       const defaultSort = resolveTableDefaultSort(settingsStore.editorSettings, effectiveDbType, loadedTableMeta?.physicalPrimaryKeys ?? physicalTablePrimaryKeys(columns), connectionStore.connectionIdentifierQuote?.(node.connectionId));
       const defaultOrderBy = defaultSort.orderBy;
-      const includeRowId = shouldIncludeSyntheticRowId(effectiveDbType, primaryKeys, tableType);
-      const sql = await buildTableSelectSql({
-        databaseType: effectiveDbType,
-        driverProfile: config?.driver_profile || (config?.db_type === "gbase8s" ? "gbase8s" : undefined),
-        serverVersion: connectionStore.getConfig(node.connectionId)?.database_info?.productVersion,
-        identifierQuote: connectionStore.connectionIdentifierQuote?.(node.connectionId),
-        schema: connectionTableSqlSchema(config, tableSchema),
-        database: node.database,
-        tableName: node.label,
-        tableType,
-        catalog: node.catalog,
-        columns: columns.map((column) => column.name),
-        primaryKeys,
-        ...tableDataLargeValuePreviewOptions(effectiveDbType, columns, primaryKeys, limit),
-        includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
-        limit,
-        includeRowId,
-        injectDefaultTimeSeriesWhere: true,
-        orderBy: defaultOrderBy,
-      });
+      // #12647：首开路径同样尊重"该连接的行定位器已被引擎拒绝"的记忆，否则
+      // 被降级过的连接每次重新单击表都会再发一次注定失败的定位器查询。
+      const includeRowId = shouldIncludeSyntheticRowId(effectiveDbType, primaryKeys, tableType) && !rowIdLocatorUnsupported(node.connectionId);
+      const buildOpenSql = (withRowId: boolean) =>
+        buildTableSelectSql({
+          databaseType: effectiveDbType,
+          driverProfile: config?.driver_profile || (config?.db_type === "gbase8s" ? "gbase8s" : undefined),
+          serverVersion: connectionStore.getConfig(node.connectionId)?.database_info?.productVersion,
+          identifierQuote: connectionStore.connectionIdentifierQuote?.(node.connectionId),
+          schema: connectionTableSqlSchema(config, tableSchema),
+          database: node.database,
+          tableName: node.label,
+          tableType,
+          catalog: node.catalog,
+          columns: columns.map((column) => column.name),
+          primaryKeys,
+          ...tableDataLargeValuePreviewOptions(effectiveDbType, columns, primaryKeys, limit),
+          includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
+          limit,
+          includeRowId: withRowId,
+          injectDefaultTimeSeriesWhere: true,
+          orderBy: defaultOrderBy,
+        });
+      const sql = await buildOpenSql(includeRowId);
       // SQL 构建是异步后端调用：期间更晚的导航（openData/openTableTarget）
       // 接管会替换 executionId，旧流程不得再覆盖 SQL/启动查询
       if (!isActive()) {
@@ -443,11 +448,35 @@ export function useSidebarDataOpenRuntime() {
       logPhase("sql-updated", { tabId });
 
       openDataLog("info", "execute:start", { traceId, tabId, elapsed: elapsed() });
-      await queryStore.executeTabSql(tabId, sql, {
-        sourceTraceId: traceId,
-        skipEnsureConnected: true,
-        pagination: { limit, offset: 0 },
-      });
+      const executeOptions = { sourceTraceId: traceId, skipEnsureConnected: true, pagination: { limit, offset: 0 } };
+      let openExecuteError: unknown = undefined;
+      try {
+        await queryStore.executeTabSql(tabId, sql, executeOptions);
+      } catch (error) {
+        openExecuteError = error;
+      }
+      // 行定位器被引擎拒绝时的降级（#12647）：首开路径与 reload 路径保持同一
+      // 降级语义——去掉定位器重试一次，成功才记住该连接，失败则还原标记让
+      // 真实的服务端错误可见。执行失败既可能以异常上抛，也可能落成带
+      // execution_error 的结果，两种形态都归一到结果上再判定。
+      if (openExecuteError !== undefined) {
+        const failedTab = queryStore.tabs.find((item) => item.id === tabId);
+        if (!failedTab?.result) queryStore.setErrorResult(tabId, openExecuteError);
+      }
+      if (shouldRetryWithoutRowIdLocator(sql, node.connectionId, queryStore.tabs.find((item) => item.id === tabId)?.result)) {
+        markRowIdLocatorUnsupported(node.connectionId);
+        try {
+          const fallbackSql = await buildOpenSql(false);
+          queryStore.updateSql(tabId, fallbackSql);
+          await queryStore.executeTabSql(tabId, fallbackSql, executeOptions);
+          const retryResult = queryStore.tabs.find((item) => item.id === tabId)?.result;
+          if (!shouldKeepRowIdLocatorDisabled(retryResult)) markRowIdLocatorSupported(node.connectionId);
+        } catch {
+          markRowIdLocatorSupported(node.connectionId);
+        }
+      } else if (openExecuteError !== undefined) {
+        throw openExecuteError;
+      }
       openDataLog("info", "execute:done", { traceId, tabId, elapsed: elapsed() });
       const sortedTab = queryStore.tabs.find((item) => item.id === tabId);
       if ((request?.isCurrent() ?? true) && sortedTab && sortedTab === openedTab && sortedTab.sql === sql) {
