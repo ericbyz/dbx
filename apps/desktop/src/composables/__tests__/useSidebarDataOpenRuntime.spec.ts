@@ -135,6 +135,7 @@ vi.mock("@/lib/backend/debugLog", () => ({ appendDebugLog: vi.fn(), isDebugLoggi
 vi.mock("@/lib/sidebar/treeNodeContext", () => ({ hasTreeNodeDatabaseContext: () => true }));
 vi.mock("@/lib/table/tableSelectSql", async (importOriginal) => ({ ...(await importOriginal<typeof import("@/lib/table/tableSelectSql")>()), buildTableSelectSql: mocks.buildTableSelectSql }));
 vi.mock("@/lib/table/tableEditing", () => ({
+  DBX_ROWID_COLUMN: "__DBX_ROWID",
   physicalTablePrimaryKeys: (columns: Array<{ name: string; is_primary_key: boolean }>, indexes: Array<{ columns: string[]; is_primary: boolean }> = []) => {
     const columnPrimaryKeys = columns.filter((column) => column.is_primary_key).map((column) => column.name);
     return columnPrimaryKeys.length > 0 ? columnPrimaryKeys : (indexes.find((index) => index.is_primary && index.columns.length > 0)?.columns ?? []);
