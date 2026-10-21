@@ -84,7 +84,7 @@ import { formatRedisConsoleValue } from "@/lib/redis/redisValuePresentation";
 import { usesAgentCursorForQuery, usesAgentCursorForTableData } from "@/lib/database/databaseDriverManifest";
 import { connectionIsDorisFamilyCatalogCapable, defaultAutoCommitForDbType, supportsClearableQuerySchema, supportsTransaction, usesOracleStickyTransactionState, usesProvenReadOnlyStickyTransactionState } from "@/lib/database/databaseFeatureSupport";
 import { canInsertTableRows, canUseKeylessRowPredicate, DBX_ROWID_COLUMN, shouldIncludeSyntheticRowId, usesSyntheticRowIdKey } from "@/lib/table/tableEditing";
-import { markRowIdLocatorSupported, markRowIdLocatorUnsupported, rowIdLocatorUnsupported, shouldKeepRowIdLocatorDisabled, shouldRetryWithoutRowIdLocator } from "@/lib/table/tableRowIdSupport";
+import { markRowIdLocatorUnsupported, rowIdLocatorUnsupported, shouldKeepRowIdLocatorDisabled, shouldRetryWithoutRowIdLocator } from "@/lib/table/tableRowIdSupport";
 import { TABLE_DATA_EXPORT_PAGE_SIZE } from "@/lib/table/tableDataExport";
 import { repairRestoredDataTabTableIdentity, tableMetaForDataTab } from "@/lib/table/tableDataTabMeta";
 import { isDataTabMetadataLifecycleStale } from "@/lib/sidebar/dataTabOpenPolicy";
@@ -5507,34 +5507,47 @@ export const useQueryStore = defineStore("query", () => {
       const current = tabs.value.find((candidate) => candidate.id === id);
       if (!current || current.executionId !== refreshPreparationId) return false;
       updateSql(tab.id, sql);
-      const tabResult = () => tabs.value.find((candidate) => candidate.id === id)?.result;
       const executeOptions = {
         pagination: { limit, offset },
         preserveResultDuringExecution: true,
         publicationOrigin: "refresh" as const,
       };
       let refreshExecuteError: unknown = undefined;
+      let refreshExecutePublished: boolean | undefined;
       try {
-        await executeTabSql(tab.id, sql, executeOptions);
+        refreshExecutePublished = await executeTabSql(tab.id, sql, executeOptions);
       } catch (error) {
         refreshExecuteError = error;
       }
-      if (refreshExecuteError !== undefined && !tabResult()) {
+      const executedTab = tabs.value.find((candidate) => candidate.id === id);
+      if (refreshExecuteError !== undefined && executedTab === tab && !executedTab.isExecuting && !executedTab.result) {
         // 执行失败以异常上抛且尚未落结果时，先转成标准错误结果再统一判定。
         setErrorResult(id, refreshExecuteError);
       }
+      if (refreshExecutePublished === false || executedTab !== tab || executedTab.isExecuting) return false;
+      const failedResult = executedTab.result;
+      const failedResultGeneration = executedTab.resultViewGeneration;
+      const stillOwnsFailedResult = () => {
+        const current = tabs.value.find((candidate) => candidate.id === id);
+        return current === executedTab && !current.isExecuting && current.executionId === undefined && current.result === failedResult && current.resultViewGeneration === failedResultGeneration;
+      };
       // 行定位器被引擎拒绝时的降级（#12647）：首开/刷新路径与 reload 路径保持
-      // 同一降级语义——去掉定位器重试一次，成功才记住该连接，失败则还原标记
-      // 让真实的服务端错误可见。
-      if (shouldRetryWithoutRowIdLocator(sql, tab.connectionId, tabResult())) {
-        markRowIdLocatorUnsupported(tab.connectionId);
+      // 同一降级语义——去掉定位器重试一次，成功后才记住该连接；失败不更新
+      // 能力标记，让真实的服务端错误可见。
+      if (shouldRetryWithoutRowIdLocator(sql, tab.connectionId, failedResult)) {
         try {
           const fallbackSql = await buildRefreshSql(false);
+          if (!stillOwnsFailedResult()) return false;
           updateSql(tab.id, fallbackSql);
-          await executeTabSql(tab.id, fallbackSql, executeOptions);
-          if (!shouldKeepRowIdLocatorDisabled(tabResult())) markRowIdLocatorSupported(tab.connectionId);
+          const fallbackPublished = await executeTabSql(tab.id, fallbackSql, executeOptions);
+          const retryTab = tabs.value.find((candidate) => candidate.id === id);
+          if (fallbackPublished === false || retryTab !== tab || retryTab.isExecuting) {
+            return false;
+          }
+          if (shouldKeepRowIdLocatorDisabled(retryTab.result)) markRowIdLocatorUnsupported(tab.connectionId);
         } catch {
-          markRowIdLocatorSupported(tab.connectionId);
+          // Fallback execution keeps its own error result visible and must not
+          // change the connection capability memory.
         }
       } else if (refreshExecuteError !== undefined) {
         throw refreshExecuteError;

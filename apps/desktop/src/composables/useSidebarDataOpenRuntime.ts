@@ -14,7 +14,7 @@ import { hasTreeNodeDatabaseContext } from "@/lib/sidebar/treeNodeContext";
 import { buildTableSelectSql, requiresEagerTableMetadataForDataOpen } from "@/lib/table/tableSelectSql";
 import { resolveTableDefaultSort, applyTableDefaultSortResult } from "@/lib/table/tableDefaultSort";
 import { physicalTablePrimaryKeys, shouldIncludeSyntheticRowId } from "@/lib/table/tableEditing";
-import { markRowIdLocatorSupported, markRowIdLocatorUnsupported, rowIdLocatorUnsupported, shouldKeepRowIdLocatorDisabled, shouldRetryWithoutRowIdLocator } from "@/lib/table/tableRowIdSupport";
+import { markRowIdLocatorUnsupported, rowIdLocatorUnsupported, shouldKeepRowIdLocatorDisabled, shouldRetryWithoutRowIdLocator } from "@/lib/table/tableRowIdSupport";
 import { tableOpenPageLimit } from "@/lib/table/tableOpenPageLimit";
 import { tableDataLargeValuePreviewOptions } from "@/lib/dataGrid/dataGridLargeValues";
 import { canActivateExistingDataTableTab } from "@/lib/tabs/dataTabActivation";
@@ -267,6 +267,7 @@ export function useSidebarDataOpenRuntime() {
     // 接管该 tab：登记本次导航代次，作废在途的 openTableTarget/openData 旧代次
     // ——旧导航即使目标身份相同（同表不同 whereInput）也不得再落地
     const navigationToken = beginDataTabNavigation(tabId);
+    const ownsNavigation = () => isCurrentDataTabNavigation(tabId, navigationToken) && (request?.isCurrent() ?? true) && options.isCurrent?.() !== false;
 
     // Cancel any previous execution on this tab before starting a new one
     const existingTab = queryStore.tabs.find((t) => t.id === tabId);
@@ -275,14 +276,12 @@ export function useSidebarDataOpenRuntime() {
       logPhase("previous-execution-cancelled", { tabId });
       // 取消等待期间可能有更晚的导航（openTableTarget/openData）接管本 tab：
       // 本代次已作废，不得再写占位元数据/executionId 覆盖新导航
-      if (!isCurrentDataTabNavigation(tabId, navigationToken) || options.isCurrent?.() === false) {
+      if (!ownsNavigation()) {
         logPhase("superseded-during-cancel", { tabId });
+        endDataTabNavigation(tabId, navigationToken);
         return;
       }
     }
-    // 取消窗口之后由 executionId 比对（isActive）保护，代次使命完成即注销；
-    // 已作废的旧 token 不因删除而复活（比对按 token 同一性）
-    endDataTabNavigation(tabId, navigationToken);
 
     const openDataId = uuid();
     // Clear previous result so DataGrid doesn't show its internal loading overlay (without stop button)
@@ -351,7 +350,7 @@ export function useSidebarDataOpenRuntime() {
     await nextTick();
 
     // Helper to check if this openData call is still active (not superseded by a newer click)
-    const isActive = () => (request?.isCurrent() ?? true) && queryStore.tabs.find((t) => t.id === tabId)?.executionId === openDataId;
+    const isActive = () => ownsNavigation() && queryStore.tabs.find((t) => t.id === tabId)?.executionId === openDataId;
 
     try {
       openDataLog("info", "ensure-connected:start", { traceId, elapsed: elapsed() });
@@ -450,29 +449,42 @@ export function useSidebarDataOpenRuntime() {
       openDataLog("info", "execute:start", { traceId, tabId, elapsed: elapsed() });
       const executeOptions = { sourceTraceId: traceId, skipEnsureConnected: true, pagination: { limit, offset: 0 } };
       let openExecuteError: unknown = undefined;
+      let openExecutePublished: boolean | undefined;
       try {
-        await queryStore.executeTabSql(tabId, sql, executeOptions);
+        openExecutePublished = await queryStore.executeTabSql(tabId, sql, executeOptions);
       } catch (error) {
         openExecuteError = error;
       }
       // 行定位器被引擎拒绝时的降级（#12647）：首开路径与 reload 路径保持同一
-      // 降级语义——去掉定位器重试一次，成功才记住该连接，失败则还原标记让
-      // 真实的服务端错误可见。执行失败既可能以异常上抛，也可能落成带
+      // 降级语义——去掉定位器重试一次，成功后才记住该连接；失败不更新能力
+      // 标记，让真实的服务端错误可见。执行失败既可能以异常上抛，也可能落成带
       // execution_error 的结果，两种形态都归一到结果上再判定。
       if (openExecuteError !== undefined) {
         const failedTab = queryStore.tabs.find((item) => item.id === tabId);
-        if (!failedTab?.result) queryStore.setErrorResult(tabId, openExecuteError);
+        if (ownsNavigation() && failedTab && openedTab && failedTab === openedTab && !failedTab.isExecuting && !failedTab.result) queryStore.setErrorResult(tabId, openExecuteError);
       }
-      if (shouldRetryWithoutRowIdLocator(sql, node.connectionId, queryStore.tabs.find((item) => item.id === tabId)?.result)) {
-        markRowIdLocatorUnsupported(node.connectionId);
+      const failedTab = queryStore.tabs.find((item) => item.id === tabId);
+      if (openExecutePublished === false || !ownsNavigation() || !failedTab || !openedTab || failedTab !== openedTab || failedTab.isExecuting) return;
+      const failedResult = failedTab.result;
+      const failedResultGeneration = failedTab.resultViewGeneration;
+      const stillOwnsFailedResult = () => {
+        const current = queryStore.tabs.find((item) => item.id === tabId);
+        return !!current && ownsNavigation() && current === failedTab && !current.isExecuting && current.executionId === undefined && current.result === failedResult && current.resultViewGeneration === failedResultGeneration;
+      };
+      if (shouldRetryWithoutRowIdLocator(sql, node.connectionId, failedResult)) {
         try {
           const fallbackSql = await buildOpenSql(false);
+          if (!stillOwnsFailedResult()) return;
           queryStore.updateSql(tabId, fallbackSql);
-          await queryStore.executeTabSql(tabId, fallbackSql, executeOptions);
-          const retryResult = queryStore.tabs.find((item) => item.id === tabId)?.result;
-          if (!shouldKeepRowIdLocatorDisabled(retryResult)) markRowIdLocatorSupported(node.connectionId);
+          const fallbackPublished = await queryStore.executeTabSql(tabId, fallbackSql, executeOptions);
+          const retryTab = queryStore.tabs.find((item) => item.id === tabId);
+          if (fallbackPublished === false || !ownsNavigation() || !retryTab || retryTab !== openedTab || retryTab.isExecuting) {
+            return;
+          }
+          if (shouldKeepRowIdLocatorDisabled(retryTab.result)) markRowIdLocatorUnsupported(node.connectionId);
         } catch {
-          markRowIdLocatorSupported(node.connectionId);
+          // Fallback execution keeps its own error result visible and must not
+          // change the connection capability memory.
         }
       } else if (openExecuteError !== undefined) {
         throw openExecuteError;
@@ -488,13 +500,15 @@ export function useSidebarDataOpenRuntime() {
         logPhase("metadata-started", { tabId, deferredForTransport: isNavicatMysqlTunnel ? "navicat_mysql" : "driver" });
       }
     } catch (e: any) {
-      if (!isActive()) {
+      if (!ownsNavigation()) {
         logPhase("superseded-after-error", { tabId });
         return;
       }
       openDataLog("error", "error", { traceId, elapsed: elapsed(), error: e });
       logPhase("error", { tabId });
       queryStore.setErrorResult(tabId, e);
+    } finally {
+      endDataTabNavigation(tabId, navigationToken);
     }
   }
 
