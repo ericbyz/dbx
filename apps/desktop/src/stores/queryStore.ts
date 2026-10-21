@@ -5534,7 +5534,7 @@ export const useQueryStore = defineStore("query", () => {
       // 行定位器被引擎拒绝时的降级（#12647）：首开/刷新路径与 reload 路径保持
       // 同一降级语义——去掉定位器重试一次，成功后才记住该连接；失败不更新
       // 能力标记，让真实的服务端错误可见。
-      if (shouldRetryWithoutRowIdLocator(sql, tab.connectionId, failedResult)) {
+      if (shouldRetryWithoutRowIdLocator(sql, failedResult)) {
         try {
           const fallbackSql = await buildRefreshSql(false);
           if (!stillOwnsFailedResult()) return false;

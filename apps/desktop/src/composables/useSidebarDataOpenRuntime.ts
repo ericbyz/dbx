@@ -427,6 +427,7 @@ export function useSidebarDataOpenRuntime() {
           orderBy: defaultOrderBy,
         });
       const sql = await buildOpenSql(includeRowId);
+      let finalExecutedSql = sql;
       // SQL 构建是异步后端调用：期间更晚的导航（openData/openTableTarget）
       // 接管会替换 executionId，旧流程不得再覆盖 SQL/启动查询
       if (!isActive()) {
@@ -471,7 +472,7 @@ export function useSidebarDataOpenRuntime() {
         const current = queryStore.tabs.find((item) => item.id === tabId);
         return !!current && ownsNavigation() && current === failedTab && !current.isExecuting && current.executionId === undefined && current.result === failedResult && current.resultViewGeneration === failedResultGeneration;
       };
-      if (shouldRetryWithoutRowIdLocator(sql, node.connectionId, failedResult)) {
+      if (shouldRetryWithoutRowIdLocator(sql, failedResult)) {
         try {
           const fallbackSql = await buildOpenSql(false);
           if (!stillOwnsFailedResult()) return;
@@ -481,6 +482,7 @@ export function useSidebarDataOpenRuntime() {
           if (fallbackPublished === false || !ownsNavigation() || !retryTab || retryTab !== openedTab || retryTab.isExecuting) {
             return;
           }
+          finalExecutedSql = fallbackSql;
           if (shouldKeepRowIdLocatorDisabled(retryTab.result)) markRowIdLocatorUnsupported(node.connectionId);
         } catch {
           // Fallback execution keeps its own error result visible and must not
@@ -491,7 +493,7 @@ export function useSidebarDataOpenRuntime() {
       }
       openDataLog("info", "execute:done", { traceId, tabId, elapsed: elapsed() });
       const sortedTab = queryStore.tabs.find((item) => item.id === tabId);
-      if ((request?.isCurrent() ?? true) && sortedTab && sortedTab === openedTab && sortedTab.sql === sql) {
+      if ((request?.isCurrent() ?? true) && sortedTab && sortedTab === openedTab && sortedTab.sql === finalExecutedSql) {
         applyTableDefaultSortResult(sortedTab, defaultSort, queryStore.sortTabResultLocally);
       }
       logPhase("execute-tab-sql", { tabId });
