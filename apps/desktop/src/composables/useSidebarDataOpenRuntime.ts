@@ -352,6 +352,20 @@ export function useSidebarDataOpenRuntime() {
     // Helper to check if this openData call is still active (not superseded by a newer click)
     const isActive = () => ownsNavigation() && queryStore.tabs.find((t) => t.id === tabId)?.executionId === openDataId;
 
+    // 执行发布后的结果身份：executeTabSql 启动即把 tab.executionId 换成其内部
+    // 执行 id，此后 isActive 不再可用。执行后的错误落地改按"本流程发布的
+    // 结果仍在 tab 上"判定，而不是仅靠导航 token——导航 token 识别不了
+    // 同页签新手动执行对 executionId 的替换（#13007 复审 P1）。
+    let publishedTab: (typeof queryStore.tabs)[number] | undefined;
+    let publishedResult: (typeof queryStore.tabs)[number]["result"];
+    let publishedResultGeneration: (typeof queryStore.tabs)[number]["resultViewGeneration"];
+    let ownsPublishedResult = false;
+    const stillOwnsPublishedResult = () => {
+      if (!ownsPublishedResult) return false;
+      const current = queryStore.tabs.find((item) => item.id === tabId);
+      return !!current && ownsNavigation() && current === publishedTab && !current.isExecuting && current.executionId === undefined && current.result === publishedResult && current.resultViewGeneration === publishedResultGeneration;
+    };
+
     try {
       openDataLog("info", "ensure-connected:start", { traceId, elapsed: elapsed() });
       await connectionStore.ensureConnected(node.connectionId);
@@ -451,6 +465,7 @@ export function useSidebarDataOpenRuntime() {
       const executeOptions = { sourceTraceId: traceId, skipEnsureConnected: true, pagination: { limit, offset: 0 } };
       let openExecuteError: unknown = undefined;
       let openExecutePublished: boolean | undefined;
+      let landedOpenExecuteError = false;
       try {
         openExecutePublished = await queryStore.executeTabSql(tabId, sql, executeOptions);
       } catch (error) {
@@ -462,20 +477,26 @@ export function useSidebarDataOpenRuntime() {
       // execution_error 的结果，两种形态都归一到结果上再判定。
       if (openExecuteError !== undefined) {
         const failedTab = queryStore.tabs.find((item) => item.id === tabId);
-        if (ownsNavigation() && failedTab && openedTab && failedTab === openedTab && !failedTab.isExecuting && !failedTab.result) queryStore.setErrorResult(tabId, openExecuteError);
+        if (ownsNavigation() && failedTab && openedTab && failedTab === openedTab && !failedTab.isExecuting && !failedTab.result) {
+          queryStore.setErrorResult(tabId, openExecuteError);
+          landedOpenExecuteError = true;
+        }
       }
       const failedTab = queryStore.tabs.find((item) => item.id === tabId);
       if (openExecutePublished === false || !ownsNavigation() || !failedTab || !openedTab || failedTab !== openedTab || failedTab.isExecuting) return;
-      const failedResult = failedTab.result;
-      const failedResultGeneration = failedTab.resultViewGeneration;
-      const stillOwnsFailedResult = () => {
-        const current = queryStore.tabs.find((item) => item.id === tabId);
-        return !!current && ownsNavigation() && current === failedTab && !current.isExecuting && current.executionId === undefined && current.result === failedResult && current.resultViewGeneration === failedResultGeneration;
-      };
-      if (shouldRetryWithoutRowIdLocator(sql, failedResult)) {
+      // 只有能证明当前结果是本流程发布/归一的，才把它登记为本流程的结果身
+      // 份：执行以异常收场且上方的 setErrorResult 没有落地（结果已被占用，
+      // 可能属于已完成的同页签新执行）时，本流程不得再基于当前结果降级或
+      // 落地错误。执行成功发布（true）或结果为空时当前结果即本流程的。
+      if (openExecuteError !== undefined && !landedOpenExecuteError) return;
+      publishedTab = failedTab;
+      publishedResult = failedTab.result;
+      publishedResultGeneration = failedTab.resultViewGeneration;
+      ownsPublishedResult = true;
+      if (shouldRetryWithoutRowIdLocator(sql, publishedResult)) {
         try {
           const fallbackSql = await buildOpenSql(false);
-          if (!stillOwnsFailedResult()) return;
+          if (!stillOwnsPublishedResult()) return;
           queryStore.updateSql(tabId, fallbackSql);
           const fallbackPublished = await queryStore.executeTabSql(tabId, fallbackSql, executeOptions);
           const retryTab = queryStore.tabs.find((item) => item.id === tabId);
@@ -502,7 +523,12 @@ export function useSidebarDataOpenRuntime() {
         logPhase("metadata-started", { tabId, deferredForTransport: isNavicatMysqlTunnel ? "navicat_mysql" : "driver" });
       }
     } catch (e: any) {
-      if (!ownsNavigation()) {
+      // 准备阶段（连接/元数据/SQL 构建）的失败仍按执行身份判定所有权：同页签
+      // 的新手动执行会替换 executionId，导航 token 看不见这次替换，旧流程不得
+      // 用 setErrorResult 覆盖新执行的执行状态。执行已发布后的失败（上面的
+      // openExecuteError 重抛、结果后处理）改按结果身份判定。
+      const ownsErrorLanding = ownsPublishedResult ? stillOwnsPublishedResult() : isActive();
+      if (!ownsErrorLanding) {
         logPhase("superseded-after-error", { tabId });
         return;
       }

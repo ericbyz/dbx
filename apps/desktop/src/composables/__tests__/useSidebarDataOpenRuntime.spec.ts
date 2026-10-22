@@ -369,6 +369,63 @@ describe("useSidebarDataOpenRuntime", () => {
     expect(rowIdLocatorUnsupported("connection-1")).toBe(false);
   });
 
+  it("still lands preparation failures while the flow owns the tab", async () => {
+    mocks.ensureConnected.mockRejectedValue(new Error("connection refused"));
+
+    await useSidebarDataOpenRuntime().openData(tableNode);
+
+    expect(mocks.setErrorResult).toHaveBeenCalledTimes(1);
+    expect(mocks.setErrorResult).toHaveBeenCalledWith("tab-1", expect.any(Error));
+  });
+
+  it("does not land a late ensure-connected failure over a newer execution on the same tab", async () => {
+    let rejectEnsureConnected!: (error: unknown) => void;
+    mocks.ensureConnected.mockImplementation(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectEnsureConnected = reject;
+        }),
+    );
+
+    const open = useSidebarDataOpenRuntime().openData(tableNode);
+    await vi.waitFor(() => expect(mocks.ensureConnected).toHaveBeenCalledTimes(1));
+    const tab = mocks.tabs[0]!;
+    // 同页签的手动执行接管：替换 executionId 并进入执行态，导航代次不变
+    tab.executionId = "newer-execution";
+    tab.isExecuting = true;
+
+    rejectEnsureConnected(new Error("old preparation failed"));
+    await open;
+
+    expect(mocks.setErrorResult).not.toHaveBeenCalled();
+    expect(tab.executionId).toBe("newer-execution");
+    expect(tab.isExecuting).toBe(true);
+  });
+
+  it("does not land a late first-SQL-build failure over a newer execution on the same tab", async () => {
+    let rejectBuildOpenSql!: (error: unknown) => void;
+    mocks.buildTableSelectSql.mockImplementation(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectBuildOpenSql = reject;
+        }),
+    );
+
+    const open = useSidebarDataOpenRuntime().openData(tableNode);
+    await vi.waitFor(() => expect(mocks.buildTableSelectSql).toHaveBeenCalledTimes(1));
+    const tab = mocks.tabs[0]!;
+    tab.executionId = "newer-execution";
+    tab.isExecuting = true;
+
+    rejectBuildOpenSql(new Error("old preparation failed"));
+    await open;
+
+    expect(mocks.setErrorResult).not.toHaveBeenCalled();
+    expect(mocks.buildTableSelectSql).toHaveBeenCalledTimes(1);
+    expect(tab.executionId).toBe("newer-execution");
+    expect(tab.isExecuting).toBe(true);
+  });
+
   it("retries an already-issued row-id query after another request caches the unsupported capability", async () => {
     mocks.databaseType = "postgres";
     mocks.includeSyntheticRowId = true;
